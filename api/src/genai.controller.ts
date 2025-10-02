@@ -1,9 +1,23 @@
 import { Controller, Get, Post, HttpException, HttpStatus, Query, Res, Body } from '@nestjs/common';
 import { GenAIService } from './genai.service';
-import { ApiOkResponse, ApiOperation, ApiResponse } from '@nestjs/swagger';
+import { ApiOkResponse, ApiOperation, ApiResponse, ApiBody } from '@nestjs/swagger';
 import { Response } from 'express';
 import { ChatDto } from "./chat.dto";
 import {TYPES} from "./message.dto";
+
+
+type Role = 'system' | 'user' | 'assistant';
+
+interface ConversationMessage {
+  role: Role;
+  content: string;
+}
+
+interface RagIndexedRequest {
+  conversation: ConversationMessage[];
+  collectionName: string;
+}
+
 
 @Controller('genai')
 export class GenAIController {
@@ -115,21 +129,75 @@ export class GenAIController {
     return `Successfully indexed ${totalVectors} chunks!`;
   }
 
-  @Get('ragIndexed')
-  @ApiOperation({ summary: 'Exchange a message with an GenAI model using RAG with an indexed collection.' })
+  @Get('indexJSON')
+  @ApiOperation({ summary: 'Index a collection of files.' })
   @ApiOkResponse({
     description: 'The response from the model.'
   })
   @ApiResponse({ status: 500, description: 'Internal server error.'})
-  async ragIndexed(@Query('message') message: string, @Query('collectionName') collectionName: string): Promise<string> {
-    const response = await this.genAIService.ragIndexed(message, collectionName);
+  async indexJSON(@Query('name') name: string, @Query('srcDir') srcDir: string): Promise<string> {
+    const response = await this.genAIService.indexJSON(name, srcDir);
 
     if (response === null) {
       throw new HttpException('Internal server error', HttpStatus.INTERNAL_SERVER_ERROR);
     }
 
+    const totalVectors = response.index.getCurrentCount();
+    return `Successfully indexed ${totalVectors} chunks!`;
+  }
+
+  // @Get('ragIndexed')
+  // @ApiOperation({ summary: 'Exchange a message with an GenAI model using RAG with an indexed collection.' })
+  // @ApiOkResponse({
+  //   description: 'The response from the model.'
+  // })
+  // @ApiResponse({ status: 500, description: 'Internal server error.'})
+  // async ragIndexed(@Query('message') message: string, @Query('collectionName') collectionName: string): Promise<string> {
+  //   const response = await this.genAIService.ragIndexed(message, collectionName);
+
+  //   if (response === null) {
+  //     throw new HttpException('Internal server error', HttpStatus.INTERNAL_SERVER_ERROR);
+  //   }
+
+  //   return response;
+  // }
+
+  
+  @Post('ragIndexed')
+  @ApiOperation({ summary: 'Conversational RAG over an indexed collection.' })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['conversation', 'collectionName'],
+      properties: {
+        conversation: {
+          type: 'array',
+          minItems: 1,
+          items: {
+            type: 'object',
+            required: ['role', 'content'],
+            properties: {
+              role: { type: 'string', enum: ['system', 'user', 'assistant'] },
+              content: { type: 'string' },
+            },
+          },
+        },
+        collectionName: { type: 'string' },
+      },
+    },
+  })
+  @ApiOkResponse({ description: 'The response from the model.' })
+  @ApiResponse({ status: 500, description: 'Internal server error.' })
+  async ragIndexedPost(@Body() body: RagIndexedRequest): Promise<string> {
+    const response = await this.genAIService.ragIndexed(body.conversation, body.collectionName);
+
+    if (response === null) {
+      throw new HttpException('Internal server error', HttpStatus.INTERNAL_SERVER_ERROR);
+    }
     return response;
   }
+
+
 
   @Get('rag')
   @ApiOperation({ summary: 'Exchange a message with an GenAI model using RAG.' })

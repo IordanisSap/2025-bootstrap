@@ -13,6 +13,7 @@ import { pull } from "langchain/hub";
 import { Annotation, StateGraph } from "@langchain/langgraph";
 import { ChatDto } from "./chat.dto";
 import { TYPES } from "./message.dto";
+import { subjectSelectionPromptTemplate } from "./prompts/templates";
 
 import {
   BedrockRuntimeClient,
@@ -34,6 +35,7 @@ export class GenAIService {
     return new ChatBedrockConverse({
       region: process.env.AWS_REGION ?? "us-east-1",
       model: GenAIService.GENAI_MODEL,
+      temperature: 0.0,
       credentials: {
         secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY ?? "",
         accessKeyId: process.env.AWS_ACCESS_KEY_ID ?? "",
@@ -174,11 +176,11 @@ export class GenAIService {
    */
     async indexJSON(name: string, srcDir: string): Promise<HNSWLib | null> {
       try {
-        const METADATA_FIELDS = ["general_info"]
         const INDEX_FIELDS = ["general_info", "course_objectives", "course_content", "student_evaluation"]
         const embeddingsModel = this.getEmbeddingsModel();
         const srcDirPath = process.cwd() + '/data/' + srcDir;
-        const files = await fs.readdir(srcDirPath);
+        let files = await fs.readdir(srcDirPath);
+        files = files.filter((f: string) => f.toLowerCase().endsWith(".json"));
         const docs: Document[] = [];
   
 
@@ -189,23 +191,29 @@ export class GenAIService {
           const chunks = INDEX_FIELDS.map(field => {
             if (loadedDoc[field]) {
               return new Document({
-                pageContent: loadedDoc[field],
-                metadata: METADATA_FIELDS.reduce((acc, metaField) => {
-                  acc[metaField] = loadedDoc[metaField] || null;
-                  return acc;
-                }, {} as Record<string, any>)
+                pageContent: typeof loadedDoc[field] === 'object' 
+                  ? JSON.stringify(loadedDoc[field]) 
+                  : loadedDoc[field],
+                metadata: {
+                  courseId: loadedDoc["general_info"]["course_id"]
+                }
               });
             }
             return null;
           });
 
-          docs.push(...loadedDoc);
+          docs.push(...chunks.filter(c => c !== null) as Document[]);
         }
   
         const splitter = new RecursiveCharacterTextSplitter({
           chunkSize: 1000, chunkOverlap: 200
         });
         const allSplits = await splitter.splitDocuments(docs);
+
+        // Cleanup
+        allSplits.forEach(doc => {
+          delete doc.metadata.loc;
+        });
   
         const vectorStore = await HNSWLib.fromDocuments(allSplits, embeddingsModel);
         await vectorStore.save(process.cwd() + "/" + GenAIService.VECTORSTORE_DIR + "/" + name);
@@ -223,58 +231,58 @@ export class GenAIService {
    * @param collectionName The name of the collection to retrieve from.
    * @returns The generated answer or null if an error occurs.
    */
-  async ragIndexed(message: string, collectionName: string): Promise<string | null> {
-    try {
-      const llm = this.getGenAIModel();
-      const embeddingsModel = this.getEmbeddingsModel();
-      const vectorStore = await HNSWLib.load(process.cwd() + "/" + GenAIService.VECTORSTORE_DIR + "/" + collectionName, embeddingsModel);
+  // async ragIndexed(message: string, collectionName: string): Promise<string | null> {
+  //   try {
+  //     const llm = this.getGenAIModel();
+  //     const embeddingsModel = this.getEmbeddingsModel();
+  //     const vectorStore = await HNSWLib.load(process.cwd() + "/" + GenAIService.VECTORSTORE_DIR + "/" + collectionName, embeddingsModel);
 
-      const promptTemplate = await pull<ChatPromptTemplate>("rlm/rag-prompt");
+  //     const promptTemplate = await pull<ChatPromptTemplate>("rlm/rag-prompt");
 
-      const InputStateAnnotation = Annotation.Root({
-        question: Annotation<string>,
-      });
+  //     const InputStateAnnotation = Annotation.Root({
+  //       question: Annotation<string>,
+  //     });
 
-      const StateAnnotation = Annotation.Root({
-        question: Annotation<string>,
-        context: Annotation<Document[]>,
-        answer: Annotation<string>,
-      });
+  //     const StateAnnotation = Annotation.Root({
+  //       question: Annotation<string>,
+  //       context: Annotation<Document[]>,
+  //       answer: Annotation<string>,
+  //     });
 
-      const retrieve = async (state: typeof InputStateAnnotation.State) => {
-        const retrievedDocs = await vectorStore.similaritySearch(state.question);
-        return { context: retrievedDocs };
-      };
+  //     const retrieve = async (state: typeof InputStateAnnotation.State) => {
+  //       const retrievedDocs = await vectorStore.similaritySearch(state.question);
+  //       return { context: retrievedDocs };
+  //     };
 
-      const generate = async (state: typeof StateAnnotation.State) => {
-        const docsContent = state.context.map(doc => doc.pageContent).join("\n");
-        const messages = await promptTemplate.invoke({ question: state.question, context: docsContent });
-        const response = await llm.invoke(messages);
-        return { answer: response.content };
-      };
+  //     const generate = async (state: typeof StateAnnotation.State) => {
+  //       const docsContent = state.context.map(doc => doc.pageContent).join("\n");
+  //       const messages = await promptTemplate.invoke({ question: state.question, context: docsContent });
+  //       const response = await llm.invoke(messages);
+  //       return { answer: response.content };
+  //     };
 
-      const graph = new StateGraph(StateAnnotation)
-          .addNode("retrieve", retrieve)
-          .addNode("generate", generate)
-          .addEdge("__start__", "retrieve")
-          .addEdge("retrieve", "generate")
-          .addEdge("generate", "__end__")
-          .compile();
+  //     const graph = new StateGraph(StateAnnotation)
+  //         .addNode("retrieve", retrieve)
+  //         .addNode("generate", generate)
+  //         .addEdge("__start__", "retrieve")
+  //         .addEdge("retrieve", "generate")
+  //         .addEdge("generate", "__end__")
+  //         .compile();
 
-      // Invoke the graph and get the result
-      const result = await graph.invoke({ question: message });
+  //     // Invoke the graph and get the result
+  //     const result = await graph.invoke({ question: message });
 
-      console.log(`\nCitations: ${result.context.length}`);
-      console.log(result.context.slice(0, 2));
+  //     console.log(`\nCitations: ${result.context.length}`);
+  //     console.log(result.context.slice(0, 2));
 
-      return result.answer;
-    } catch ( err ) {
-      console.log("Error in GenAIService.rag:", err);
-      return null;
-    }
-  }
+  //     return result.answer;
+  //   } catch ( err ) {
+  //     console.log("Error in GenAIService.rag:", err);
+  //     return null;
+  //   }
+  // }
 
-  async ragIndexed2(
+  async ragIndexed(
     conversation: Array<{ role: "system" | "user" | "assistant"; content: string }>,
     collectionName: string
   ): Promise<string | null> {
@@ -300,10 +308,14 @@ export class GenAIService {
             conversation.map(m => `[${m.role}] ${m.content}`).join("\n")
         }
       ];
-  
+      const lastUser = [...conversation].reverse().find(m => m.role === "user");
+      const userQuestionOriginal = lastUser?.content ?? "";
+
       const decisionRaw = await llm.invoke(decisionPrompt as any);
       let needRag = true;
       let rewrittenQuestion = "";
+      console.log("RAG needed: " + needRag);
+
   
       try {
         const parsed = JSON.parse(
@@ -317,6 +329,9 @@ export class GenAIService {
         needRag = true;
         rewrittenQuestion = lastUser?.content ?? "";
       }
+
+      console.log("Rewritten question: " + rewrittenQuestion);
+      
   
       // If RAG is not needed, answer directly based on the conversation
       if (!needRag) {
@@ -333,22 +348,22 @@ export class GenAIService {
       );
   
       // 3) Use your existing RAG prompt/template
-      const promptTemplate = await pull<ChatPromptTemplate>("rlm/rag-prompt");
+      const promptTemplate = subjectSelectionPromptTemplate;
   
       // 4) Retrieve
-      const retrievedDocs = await vectorStore.similaritySearch(rewrittenQuestion);
+      const retrievedDocs = await vectorStore.similaritySearch(rewrittenQuestion, 10);
   
       // 5) Generate from retrieved context
-      const docsContent = retrievedDocs.map(doc => doc.pageContent).join("\n");
+      const docsContent = retrievedDocs.map(doc => "Course:" + doc.metadata.courseId + "\n" + doc.pageContent).join("\n");
       const messages = await promptTemplate.invoke({
-        question: rewrittenQuestion,
+        question: userQuestionOriginal,
         context: docsContent
       });
       const response = await llm.invoke(messages);
   
       console.log(`\nCitations: ${retrievedDocs.length}`);
-      console.log(retrievedDocs.slice(0, 2));
-  
+      console.log(docsContent);
+      
       return typeof response.content === "string" ? response.content : String(response.content);
     } catch (err) {
       console.log("Error in GenAIService.rag:", err);
