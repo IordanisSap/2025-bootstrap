@@ -13,7 +13,7 @@ import { pull } from "langchain/hub";
 import { Annotation, StateGraph } from "@langchain/langgraph";
 import { ChatDto } from "./chat.dto";
 import { TYPES } from "./message.dto";
-import { subjectSelectionPromptTemplate } from "./prompts/templates";
+import {RAGNeededPrompt} from "./prompts/templates";
 
 import {
   BedrockRuntimeClient,
@@ -289,17 +289,12 @@ export class GenAIService {
     try {
       const llm = this.getGenAIModel();
       const embeddingsModel = this.getEmbeddingsModel();
-  
 
+      // 1) Decision prompt: does this need RAG?
       const decisionPrompt = [
         {
           role: "system",
-          content:
-            "You are a router that decides if retrieval (RAG) is needed for a conversation turn. " +
-            "Output STRICT JSON with keys: need_rag (boolean), rewritten_question (string). " +
-            "need_rag = true if answering requires external, factual, or document-grounded knowledge " +
-            "that may not be in the model's parameters; false if the model can answer directly. " +
-            "The rewritten_question must be a standalone, fully-specified query that resolves pronouns."
+          content: RAGNeededPrompt
         },
         {
           role: "user",
@@ -308,13 +303,14 @@ export class GenAIService {
             conversation.map(m => `[${m.role}] ${m.content}`).join("\n")
         }
       ];
-      const lastUser = [...conversation].reverse().find(m => m.role === "user");
-      const userQuestionOriginal = lastUser?.content ?? "";
+      const lastUserIdx = [...conversation].map(m => m.role).lastIndexOf("user");
+      const history = conversation.slice(0, lastUserIdx); // prior turns
+      const lastUserMsg = conversation[lastUserIdx]?.content ?? "";
 
       const decisionRaw = await llm.invoke(decisionPrompt as any);
+      
       let needRag = true;
       let rewrittenQuestion = "";
-      console.log("RAG needed: " + needRag);
 
   
       try {
@@ -332,8 +328,9 @@ export class GenAIService {
 
       console.log("Rewritten question: " + rewrittenQuestion);
       
-  
       // If RAG is not needed, answer directly based on the conversation
+      console.log("RAG needed: " + needRag);
+
       if (!needRag) {
         const directAnswer = await llm.invoke(conversation as any);
         return typeof directAnswer.content === "string"
@@ -341,29 +338,29 @@ export class GenAIService {
           : String(directAnswer.content);
       }
   
-      // 2) RAG path: load vector store only when needed
+      // 2) RAG path: load vector store
       const vectorStore = await HNSWLib.load(
         process.cwd() + "/" + GenAIService.VECTORSTORE_DIR + "/" + collectionName,
         embeddingsModel
       );
   
-      // 3) Use your existing RAG prompt/template
-      const promptTemplate = subjectSelectionPromptTemplate;
-  
-      // 4) Retrieve
+      // 3) Use existing RAG prompt/template
       const retrievedDocs = await vectorStore.similaritySearch(rewrittenQuestion, 10);
   
-      // 5) Generate from retrieved context
+      // 4) Generate from retrieved context
       const docsContent = retrievedDocs.map(doc => "Course:" + doc.metadata.courseId + "\n" + doc.pageContent).join("\n");
-      const messages = await promptTemplate.invoke({
-        question: userQuestionOriginal,
-        context: docsContent
-      });
-      const response = await llm.invoke(messages);
-  
-      console.log(`\nCitations: ${retrievedDocs.length}`);
-      console.log(docsContent);
+      for (const doc of retrievedDocs) {
+        console.log(doc.metadata);
+      }
+
+      const ragMessages = [
+        // keep a small window of recent turns to preserve continuity
+        ...history.slice(-8),
+        { role: "system", content: `Courses:\n${docsContent}` },
+        { role: "user", content: lastUserMsg }
+      ];
       
+      const response = await llm.invoke(ragMessages as any);
       return typeof response.content === "string" ? response.content : String(response.content);
     } catch (err) {
       console.log("Error in GenAIService.rag:", err);
