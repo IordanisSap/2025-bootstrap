@@ -140,11 +140,6 @@ export class GenAIService {
    */
   async index(name: string, srcDir: string): Promise<HNSWLib | null> {
     try {
-      const METADATA_FIELDS = ["general_info"]
-      const Index_fields = ["course_objectives", "course_content", "student_evaluation"]
-
-
-
       const embeddingsModel = this.getEmbeddingsModel();
       const srcDirPath = process.cwd() + '/data/' + srcDir;
       const files = await fs.readdir(srcDirPath);
@@ -171,6 +166,57 @@ export class GenAIService {
     }
   }
 
+    /**
+   * Indexes documents from a specified directory into a vector store.
+   * @param name The name of the vector store to save.
+   * @param srcDir The source directory containing documents to index.
+   * @returns The HNSWLib vector store or null if an error occurs.
+   */
+    async indexJSON(name: string, srcDir: string): Promise<HNSWLib | null> {
+      try {
+        const METADATA_FIELDS = ["general_info"]
+        const INDEX_FIELDS = ["general_info", "course_objectives", "course_content", "student_evaluation"]
+        const embeddingsModel = this.getEmbeddingsModel();
+        const srcDirPath = process.cwd() + '/data/' + srcDir;
+        const files = await fs.readdir(srcDirPath);
+        const docs: Document[] = [];
+  
+
+        for (const file of files) {
+          const filePath = process.cwd() + '/data/' + srcDir + "/" + file;
+          const jsonData = await fs.readFile(filePath, "utf-8");
+          const loadedDoc = JSON.parse(jsonData);
+          const chunks = INDEX_FIELDS.map(field => {
+            if (loadedDoc[field]) {
+              return new Document({
+                pageContent: loadedDoc[field],
+                metadata: METADATA_FIELDS.reduce((acc, metaField) => {
+                  acc[metaField] = loadedDoc[metaField] || null;
+                  return acc;
+                }, {} as Record<string, any>)
+              });
+            }
+            return null;
+          });
+
+          docs.push(...loadedDoc);
+        }
+  
+        const splitter = new RecursiveCharacterTextSplitter({
+          chunkSize: 1000, chunkOverlap: 200
+        });
+        const allSplits = await splitter.splitDocuments(docs);
+  
+        const vectorStore = await HNSWLib.fromDocuments(allSplits, embeddingsModel);
+        await vectorStore.save(process.cwd() + "/" + GenAIService.VECTORSTORE_DIR + "/" + name);
+        return vectorStore;
+  
+      } catch (err) {
+        console.log("Error in GenAIService.rag:", err);
+        return null;
+      }
+    }
+
   /**
    * Retrieves and generates a response based on indexed documents.
    * @param message The query message to process.
@@ -179,7 +225,6 @@ export class GenAIService {
    */
   async ragIndexed(message: string, collectionName: string): Promise<string | null> {
     try {
-      // Load the LLM and embeddings model
       const llm = this.getGenAIModel();
       const embeddingsModel = this.getEmbeddingsModel();
       const vectorStore = await HNSWLib.load(process.cwd() + "/" + GenAIService.VECTORSTORE_DIR + "/" + collectionName, embeddingsModel);
@@ -224,6 +269,88 @@ export class GenAIService {
 
       return result.answer;
     } catch ( err ) {
+      console.log("Error in GenAIService.rag:", err);
+      return null;
+    }
+  }
+
+  async ragIndexed2(
+    conversation: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+    collectionName: string
+  ): Promise<string | null> {
+    try {
+      const llm = this.getGenAIModel();
+      const embeddingsModel = this.getEmbeddingsModel();
+  
+
+      const decisionPrompt = [
+        {
+          role: "system",
+          content:
+            "You are a router that decides if retrieval (RAG) is needed for a conversation turn. " +
+            "Output STRICT JSON with keys: need_rag (boolean), rewritten_question (string). " +
+            "need_rag = true if answering requires external, factual, or document-grounded knowledge " +
+            "that may not be in the model's parameters; false if the model can answer directly. " +
+            "The rewritten_question must be a standalone, fully-specified query that resolves pronouns."
+        },
+        {
+          role: "user",
+          content:
+            "Conversation (most recent last):\n" +
+            conversation.map(m => `[${m.role}] ${m.content}`).join("\n")
+        }
+      ];
+  
+      const decisionRaw = await llm.invoke(decisionPrompt as any);
+      let needRag = true;
+      let rewrittenQuestion = "";
+  
+      try {
+        const parsed = JSON.parse(
+          typeof decisionRaw.content === "string" ? decisionRaw.content : String(decisionRaw.content)
+        );
+        needRag = !!parsed.need_rag;
+        rewrittenQuestion = String(parsed.rewritten_question || "").trim();
+      } catch {
+        // Fallback: if parsing fails, default to RAG on the last user message
+        const lastUser = [...conversation].reverse().find(m => m.role === "user");
+        needRag = true;
+        rewrittenQuestion = lastUser?.content ?? "";
+      }
+  
+      // If RAG is not needed, answer directly based on the conversation
+      if (!needRag) {
+        const directAnswer = await llm.invoke(conversation as any);
+        return typeof directAnswer.content === "string"
+          ? directAnswer.content
+          : String(directAnswer.content);
+      }
+  
+      // 2) RAG path: load vector store only when needed
+      const vectorStore = await HNSWLib.load(
+        process.cwd() + "/" + GenAIService.VECTORSTORE_DIR + "/" + collectionName,
+        embeddingsModel
+      );
+  
+      // 3) Use your existing RAG prompt/template
+      const promptTemplate = await pull<ChatPromptTemplate>("rlm/rag-prompt");
+  
+      // 4) Retrieve
+      const retrievedDocs = await vectorStore.similaritySearch(rewrittenQuestion);
+  
+      // 5) Generate from retrieved context
+      const docsContent = retrievedDocs.map(doc => doc.pageContent).join("\n");
+      const messages = await promptTemplate.invoke({
+        question: rewrittenQuestion,
+        context: docsContent
+      });
+      const response = await llm.invoke(messages);
+  
+      console.log(`\nCitations: ${retrievedDocs.length}`);
+      console.log(retrievedDocs.slice(0, 2));
+  
+      return typeof response.content === "string" ? response.content : String(response.content);
+    } catch (err) {
       console.log("Error in GenAIService.rag:", err);
       return null;
     }
