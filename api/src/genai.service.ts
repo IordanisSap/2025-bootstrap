@@ -13,7 +13,7 @@ import { pull } from "langchain/hub";
 import { Annotation, StateGraph } from "@langchain/langgraph";
 import { ChatDto } from "./chat.dto";
 import { TYPES } from "./message.dto";
-import {RAGNeededPrompt} from "./prompts/templates";
+import { RAGNeededPrompt, CourseDataDecisionPrompt } from "./prompts/templates";
 
 import {
   BedrockRuntimeClient,
@@ -24,6 +24,36 @@ import type { FromSchema } from "json-schema-to-ts";
 import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
 const fs = require("node:fs/promises");
 const path = require("path");
+
+
+// Helper funcs
+function extractCourseIdsFromText(text: string): string[] {
+  if (!text) return [];
+  // Example matches: CS101, CS-101, CS 101, MATH205A, EE-200B, ΗΥ-120, ΗΥ120
+  // \p{L} = any letter (Unicode), use /u flag
+  const re = /\b([\p{L}]{2,}\s?-?\s?\d{2,3}[\p{L}]?)\b/gu;
+  const hits = new Set<string>();
+  for (const m of text.normalize('NFKC').matchAll(re)) {
+    // normalize: uppercase (locale-aware), collapse spaces, normalize hyphens
+    const norm = m[1]
+      .normalize('NFKC')
+      .toLocaleUpperCase('el-GR')   // handles Greek correctly; fine for Latin too
+      .replace(/\s+/g, '')
+      .replace(/-+/g, '-');
+    hits.add(norm);
+  }
+  return [...hits];
+}
+
+function collectSeenCourseIds(
+  convo: Array<{ role: "system" | "user" | "assistant"; content: string }>
+): string[] {
+  const set = new Set<string>();
+  for (const m of convo) {
+    for (const id of extractCourseIdsFromText(m.content)) set.add(id);
+  }
+  return [...set];
+}
 
 @Injectable()
 export class GenAIService {
@@ -225,62 +255,20 @@ export class GenAIService {
       }
     }
 
-  /**
-   * Retrieves and generates a response based on indexed documents.
-   * @param message The query message to process.
-   * @param collectionName The name of the collection to retrieve from.
-   * @returns The generated answer or null if an error occurs.
-   */
-  // async ragIndexed(message: string, collectionName: string): Promise<string | null> {
-  //   try {
-  //     const llm = this.getGenAIModel();
-  //     const embeddingsModel = this.getEmbeddingsModel();
-  //     const vectorStore = await HNSWLib.load(process.cwd() + "/" + GenAIService.VECTORSTORE_DIR + "/" + collectionName, embeddingsModel);
-
-  //     const promptTemplate = await pull<ChatPromptTemplate>("rlm/rag-prompt");
-
-  //     const InputStateAnnotation = Annotation.Root({
-  //       question: Annotation<string>,
-  //     });
-
-  //     const StateAnnotation = Annotation.Root({
-  //       question: Annotation<string>,
-  //       context: Annotation<Document[]>,
-  //       answer: Annotation<string>,
-  //     });
-
-  //     const retrieve = async (state: typeof InputStateAnnotation.State) => {
-  //       const retrievedDocs = await vectorStore.similaritySearch(state.question);
-  //       return { context: retrievedDocs };
-  //     };
-
-  //     const generate = async (state: typeof StateAnnotation.State) => {
-  //       const docsContent = state.context.map(doc => doc.pageContent).join("\n");
-  //       const messages = await promptTemplate.invoke({ question: state.question, context: docsContent });
-  //       const response = await llm.invoke(messages);
-  //       return { answer: response.content };
-  //     };
-
-  //     const graph = new StateGraph(StateAnnotation)
-  //         .addNode("retrieve", retrieve)
-  //         .addNode("generate", generate)
-  //         .addEdge("__start__", "retrieve")
-  //         .addEdge("retrieve", "generate")
-  //         .addEdge("generate", "__end__")
-  //         .compile();
-
-  //     // Invoke the graph and get the result
-  //     const result = await graph.invoke({ question: message });
-
-  //     console.log(`\nCitations: ${result.context.length}`);
-  //     console.log(result.context.slice(0, 2));
-
-  //     return result.answer;
-  //   } catch ( err ) {
-  //     console.log("Error in GenAIService.rag:", err);
-  //     return null;
-  //   }
-  // }
+  async getCourseData(id: string): Promise<string> {
+    try {
+      const path = process.cwd() + '/data/combined_pdfs/combined.json';
+      const courses = JSON.parse(await fs.readFile(path, "utf-8"));
+      const course = courses.find((c: any) => c.general_info.course_id === id || c.general_info.course_id.slice(-3) === id.slice(-3));
+      if (!course) {
+        throw new Error(`Course with id ${id} not found`);
+      }
+      return JSON.stringify(course, null, 2);
+    } catch (err) {
+      console.log("Error in GenAIService.getCourseData:", err);
+      return err.toString();
+    }
+  } 
 
   async ragIndexed(
     conversation: Array<{ role: "system" | "user" | "assistant"; content: string }>,
@@ -289,13 +277,10 @@ export class GenAIService {
     try {
       const llm = this.getGenAIModel();
       const embeddingsModel = this.getEmbeddingsModel();
-
+  
       // 1) Decision prompt: does this need RAG?
       const decisionPrompt = [
-        {
-          role: "system",
-          content: RAGNeededPrompt
-        },
+        { role: "system", content: RAGNeededPrompt },
         {
           role: "user",
           content:
@@ -306,12 +291,11 @@ export class GenAIService {
       const lastUserIdx = [...conversation].map(m => m.role).lastIndexOf("user");
       const history = conversation.slice(0, lastUserIdx); // prior turns
       const lastUserMsg = conversation[lastUserIdx]?.content ?? "";
-
+  
       const decisionRaw = await llm.invoke(decisionPrompt as any);
-      
+  
       let needRag = true;
       let rewrittenQuestion = "";
-
   
       try {
         const parsed = JSON.parse(
@@ -320,17 +304,14 @@ export class GenAIService {
         needRag = !!parsed.need_rag;
         rewrittenQuestion = String(parsed.rewritten_question || "").trim();
       } catch {
-        // Fallback: if parsing fails, default to RAG on the last user message
         const lastUser = [...conversation].reverse().find(m => m.role === "user");
         needRag = true;
         rewrittenQuestion = lastUser?.content ?? "";
       }
-
+  
       console.log("Rewritten question: " + rewrittenQuestion);
-      
-      // If RAG is not needed, answer directly based on the conversation
       console.log("RAG needed: " + needRag);
-
+  
       if (!needRag) {
         const directAnswer = await llm.invoke(conversation as any);
         return typeof directAnswer.content === "string"
@@ -344,22 +325,88 @@ export class GenAIService {
         embeddingsModel
       );
   
-      // 3) Use existing RAG prompt/template
-      const retrievedDocs = await vectorStore.similaritySearch(rewrittenQuestion, 10);
+      // 3) Retrieve docs
+      const retrievedDocs = await vectorStore.similaritySearch(rewrittenQuestion || lastUserMsg, 10);
   
-      // 4) Generate from retrieved context
-      const docsContent = retrievedDocs.map(doc => "Course:" + doc.metadata.courseId + "\n" + doc.pageContent).join("\n");
-      for (const doc of retrievedDocs) {
-        console.log(doc.metadata);
+      // 4) Gather retrieved + seen course ids
+      const retrievedCourseIds = Array.from(
+        new Set(
+          retrievedDocs
+            .map(d => (d.metadata?.courseId ?? d.metadata?.course_id ?? ""))
+            .filter(Boolean)
+            .map((s: string) => String(s).toUpperCase().replace(/\s+/g, '').replace(/-+/g, '-'))
+        )
+      );
+  
+      const seenCourseIds = collectSeenCourseIds(conversation);
+      console.log("Seen course IDs in conversation:", seenCourseIds);
+      console.log("Retrieved course IDs:", retrievedCourseIds);
+  
+      // 5) Ask Claude if we should call getCourseData (STRICT JSON)
+      const courseDecisionPrompt = [
+        { role: "system", content: CourseDataDecisionPrompt },
+        {
+          role: "user",
+          content:
+            [
+              "Recent conversation (most recent last):",
+              history.slice(-8).map(m => `[${m.role}] ${m.content}`).join("\n"),
+              `[user] ${lastUserMsg}`,
+              "",
+              `seen_course_ids: ${JSON.stringify(seenCourseIds)}`,
+              `retrieved_course_ids: ${JSON.stringify(retrievedCourseIds)}`,
+              "",
+              "Your job: Decide if getCourseData should be called now."
+            ].join("\n")
+        }
+      ];
+  
+      let shouldCallCourseData = false;
+      let chosenCourseId: string | null = null;
+  
+      try {
+        const decision = await llm.invoke(courseDecisionPrompt as any);
+        const parsed = JSON.parse(
+          typeof decision.content === "string" ? decision.content : String(decision.content)
+        );
+        shouldCallCourseData = !!parsed.should_call;
+        chosenCourseId = (parsed.course_id ?? null) ? String(parsed.course_id) : null;
+        console.log("CourseData decision:", parsed);
+      } catch (e) {
+        console.log("CourseData decision parse failed, defaulting to not calling.", e);
+        shouldCallCourseData = false;
+        chosenCourseId = null;
       }
 
-      const ragMessages = [
-        // keep a small window of recent turns to preserve continuity
-        ...history.slice(-8),
-        { role: "system", content: `Courses:\n${docsContent}` },
-        { role: "user", content: lastUserMsg }
-      ];
+      console.log(`CourseData decision: shouldCall=${shouldCallCourseData}, chosenId=${chosenCourseId}`);
       
+
+      // 6) Build RAG context (optionally with course data)
+      const docsContent = retrievedDocs
+        .map(doc => "Course:" + (doc.metadata?.courseId ?? doc.metadata?.course_id ?? "UNKNOWN") + "\n" + doc.pageContent)
+        .join("\n");
+  
+      for (const doc of retrievedDocs) console.log(doc.metadata);
+  
+      const ragMessages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+        ...history.slice(-8),
+        { role: "system", content: `Courses:\n${docsContent}` }
+      ];
+  
+      if (shouldCallCourseData && chosenCourseId) {
+        try {
+          const courseJson = await this.getCourseData(chosenCourseId);
+          ragMessages.push({
+            role: "system",
+            content: `CourseData for ${chosenCourseId}:\n${courseJson}`
+          });
+        } catch (e) {
+          console.log("Error calling getCourseData; continuing without it.", e);
+        }
+      }
+  
+      ragMessages.push({ role: "user", content: lastUserMsg });
+  
       const response = await llm.invoke(ragMessages as any);
       return typeof response.content === "string" ? response.content : String(response.content);
     } catch (err) {
@@ -500,8 +547,6 @@ export class GenAIService {
       const resp = await client.send(new ConverseCommand(input));
 
       const contentBlocks = resp.output?.message?.content ?? [];
-      console.log(contentBlocks);
-
 
       // Claude returns something like: { toolUse: { name, input: {...} } }
       const toolUseBlock = contentBlocks.find((b: any) => b?.toolUse)?.toolUse;
