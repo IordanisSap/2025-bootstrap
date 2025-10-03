@@ -16,6 +16,7 @@ interface ConversationMessage {
 interface RagIndexedRequest {
   conversation: ConversationMessage[];
   collectionName: string;
+  filters: Record<string, string[]>
 }
 
 
@@ -169,7 +170,7 @@ export class GenAIController {
   @ApiBody({
     schema: {
       type: 'object',
-      required: ['conversation', 'collectionName'],
+      required: ['conversation', 'collectionName', 'filters'],
       properties: {
         conversation: {
           type: 'array',
@@ -184,38 +185,26 @@ export class GenAIController {
           },
         },
         collectionName: { type: 'string' },
+        filters: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: { type: 'string' },
+          },
+        },
       },
     },
   })
   @ApiOkResponse({ description: 'The response from the model.' })
   @ApiResponse({ status: 500, description: 'Internal server error.' })
   async ragIndexedPost(@Body() body: RagIndexedRequest): Promise<string> {
-    const response = await this.genAIService.ragIndexed(body.conversation, body.collectionName);
+    const response = await this.genAIService.ragIndexed(body.conversation, body.collectionName, body.filters);
 
     if (response === null) {
       throw new HttpException('Internal server error', HttpStatus.INTERNAL_SERVER_ERROR);
     }
     return response;
   }
-
-
-
-  @Get('rag')
-  @ApiOperation({ summary: 'Exchange a message with an GenAI model using RAG.' })
-  @ApiOkResponse({
-    description: 'The response from the model.'
-  })
-  @ApiResponse({ status: 500, description: 'Internal server error.'})
-  async rag(@Query('message') message: string): Promise<string> {
-    const response = await this.genAIService.rag(message);
-
-    if (response === null) {
-      throw new HttpException('Internal server error', HttpStatus.INTERNAL_SERVER_ERROR);
-    }
-
-    return response;
-  }
-
 
   @Get('pdfToStructuredJson')
   @ApiOperation({ summary: 'Convert PDFs to JSON' })

@@ -24,7 +24,8 @@ export const CourseDataDecisionPrompt = `
 You are deciding whether to call a tool named getCourseData(course_id) before answering.
 
 Rules (STRICT):
-- Use this tool whenever the user asks specific questions about a course.
+- Use this tool whenever the user asks specific questions about a course. If the user states his
+  preferences in general, do not call the tool.
 - Only call getCourseData if the course_id is explicitly present in the user's messages
   OR it has already appeared earlier in this same conversation OR it has been retrieved
 - If you cannot point to a previously seen course_id string (exact or same last 3 digits),

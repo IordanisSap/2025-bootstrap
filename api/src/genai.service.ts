@@ -213,28 +213,39 @@ export class GenAIService {
         files = files.filter((f: string) => f.toLowerCase().endsWith(".json"));
         const docs: Document[] = [];
   
-
         for (const file of files) {
           const filePath = process.cwd() + '/data/' + srcDir + "/" + file;
           const jsonData = await fs.readFile(filePath, "utf-8");
-          const loadedDoc = JSON.parse(jsonData);
-          const chunks = INDEX_FIELDS.map(field => {
-            if (loadedDoc[field]) {
-              return new Document({
-                pageContent: typeof loadedDoc[field] === 'object' 
-                  ? JSON.stringify(loadedDoc[field]) 
-                  : loadedDoc[field],
+          const loadedDocs = JSON.parse(jsonData);
+          
+          
+          for (const loadedDoc of loadedDocs) {
+            const chunks = INDEX_FIELDS.map(field => {              
+              if (loadedDoc[field]) {
+                return new Document({
+                  pageContent: typeof loadedDoc[field] === 'object' 
+                    ? JSON.stringify(loadedDoc[field]) 
+                    : loadedDoc[field],
+                  metadata: {
+                    courseId: loadedDoc["general_info"]["course_id"]
+                  }
+                });
+              }
+              return null;
+            });
+            if (loadedDoc["general_info"]) {
+              const course_title_chunk = new Document({
+                pageContent: `Course Title: ${loadedDoc["general_info"]["course_title"]}`,
                 metadata: {
                   courseId: loadedDoc["general_info"]["course_id"]
                 }
               });
+              chunks.push(course_title_chunk);
             }
-            return null;
-          });
-
-          docs.push(...chunks.filter(c => c !== null) as Document[]);
+            docs.push(...chunks.filter(c => c !== null) as Document[]);
+          }
         }
-  
+
         const splitter = new RecursiveCharacterTextSplitter({
           chunkSize: 1000, chunkOverlap: 200
         });
@@ -244,7 +255,8 @@ export class GenAIService {
         allSplits.forEach(doc => {
           delete doc.metadata.loc;
         });
-  
+        
+        
         const vectorStore = await HNSWLib.fromDocuments(allSplits, embeddingsModel);
         await vectorStore.save(process.cwd() + "/" + GenAIService.VECTORSTORE_DIR + "/" + name);
         return vectorStore;
@@ -270,13 +282,100 @@ export class GenAIService {
     }
   } 
 
+/**
+ * Filters retrievedDocs in-place based on dot-path filters.
+ *
+ * Rules:
+ * - Empty array value => filter ignored.
+ * - Match if doc value (at path) equals ANY allowed value (strings are case/trim normalized).
+ * - If doc value is an array => match if ANY element matches.
+ * - Missing value => fail the filter.
+ *
+ * @param filters      Record of dot-path => allowed values (arrays). Empty arrays are ignored.
+ * @param retrievedDocs Array of docs with { metadata: { courseId: string } }.
+ * @param getCourseData async function to fetch the raw JSON string for a courseId.
+ * @returns The filtered retrievedDocs array (same reference).
+ */
+async apply_filters(
+  filters: Record<string, any[] | undefined>,
+  retrievedDocs: unknown[]
+) {
+  // 1) Ensure every doc is an object (parse JSON strings if needed)
+  const docs = (retrievedDocs || []).map((d) => {
+    if (typeof d === "string") {
+      try { return JSON.parse(d); } catch { /* fall through */ }
+    }
+    return d;
+  });
+
+  const getByPath = (obj: any, path: string): any =>
+    path.split('.').reduce((acc, k) => (acc == null ? undefined : acc[k]), obj);
+
+  // Normalize strings for safer equality on Greek text (NFC + trim + lowercase)
+  const norm = (v: any) =>
+    typeof v === "string"
+      ? v.normalize("NFC").trim().toLowerCase()
+      : v;
+
+  const includesNormalized = (haystack: any[], needles: any[]) => {
+    // If array of primitives, compare element-wise (strings normalized)
+    const H = haystack.map(norm);
+    for (const n of needles) {
+      const N = norm(n);
+      if (H.includes(N)) return true;
+    }
+    return false;
+  };
+
+  const normEl = (s: string) =>
+    s.normalize('NFD').replace(/\p{M}/gu, '').toLocaleLowerCase('el').trim();
+
+  const matchesFilterValue = (docVal: any, allowedVals: any[]): boolean => {
+    if (!allowedVals || allowedVals.length === 0) return true;
+    if (docVal == null) return false;
+
+    // If the doc field is an array, match ANY element
+    if (Array.isArray(docVal)) {
+      return docVal.some(v => matchesFilterValue(v, allowedVals));
+    }
+
+    // Strings: case/diacritic-insensitive *exact OR substring* match
+    if (typeof docVal === 'string') {
+      const H = normEl(docVal);
+      return allowedVals.some(v => {
+        if (typeof v !== 'string') return false;
+        const N = normEl(v);
+        if (N.length === 0) return false; // ignore empty filter strings
+        return H === N || H.includes(N);  // exact OR substring
+      });
+    }
+
+    // Non-strings: exact, type-sensitive
+    return allowedVals.some(v => Object.is(docVal, v));
+  };
+
+  const result: any[] = [];
+
+  outer: for (const doc of docs) {
+    for (const [path, vals] of Object.entries(filters || {})) {
+      if (!Array.isArray(vals) || vals.length === 0) continue; // skip empty filter lists
+      const docVal = getByPath(doc, path);
+      if (!matchesFilterValue(docVal, vals)) continue outer;   // AND across paths
+    }
+    result.push(doc);
+  }
+
+  return result;
+}
+
   async ragIndexed(
     conversation: Array<{ role: "system" | "user" | "assistant"; content: string }>,
-    collectionName: string
+    collectionName: string,
+    filters: Record<string, string[]>
   ): Promise<string | null> {
     try {
       const llm = this.getGenAIModel();
-      const embeddingsModel = this.getEmbeddingsModel();
+      const embeddingsModel = this.getEmbeddingsModel();      
   
       // 1) Decision prompt: does this need RAG?
       const decisionPrompt = [
@@ -326,8 +425,24 @@ export class GenAIService {
       );
   
       // 3) Retrieve docs
-      const retrievedDocs = await vectorStore.similaritySearch(rewrittenQuestion || lastUserMsg, 10);
-  
+      let retrievedDocs = await vectorStore.similaritySearch(rewrittenQuestion || lastUserMsg, 15);
+
+      const wholeDocs = await Promise.all(retrievedDocs.map(async (doc) => {
+        const courseId = doc.metadata.courseId;
+        if (courseId) {
+          return await this.getCourseData(courseId);
+        }
+        return null;
+      }));
+
+    
+      const filteredDocs = await this.apply_filters(filters, wholeDocs);
+      
+      retrievedDocs = retrievedDocs.filter(d => new Set(filteredDocs.map(f => f["general_info"]["course_id"])).has(d.metadata.courseId));
+      
+
+
+
       // 4) Gather retrieved + seen course ids
       const retrievedCourseIds = Array.from(
         new Set(
@@ -410,75 +525,6 @@ export class GenAIService {
       const response = await llm.invoke(ragMessages as any);
       return typeof response.content === "string" ? response.content : String(response.content);
     } catch (err) {
-      console.log("Error in GenAIService.rag:", err);
-      return null;
-    }
-  }
-
-  /**
-   * Performs a retrieval-augmented generation (RAG) process.
-   * @param message The query message to process.
-   * @returns The generated answer or null if an error occurs.
-   */
-  async rag(message: string): Promise<string | null> {
-    try {
-      // Create the models (LLM, embeddings)
-      const llm = this.getGenAIModel();
-      const embeddings = this.getEmbeddingsModel();
-
-      // Load the document and create the embeddings
-      const vectorStore = new MemoryVectorStore(embeddings);
-
-      const docLoader = new TextLoader(process.cwd() + '/data/AliceAdventuresInWonderland.txt');
-      const docs = await docLoader.load();
-
-      const splitter = new RecursiveCharacterTextSplitter({
-        chunkSize: 1000, chunkOverlap: 200
-      });
-      const allSplits = await splitter.splitDocuments(docs);
-      await vectorStore.addDocuments(allSplits);
-
-      // Prepare the Graph to process the incoming query
-      const promptTemplate = await pull<ChatPromptTemplate>("rlm/rag-prompt");
-
-      const InputStateAnnotation = Annotation.Root({
-        question: Annotation<string>,
-      });
-
-      const StateAnnotation = Annotation.Root({
-        question: Annotation<string>,
-        context: Annotation<Document[]>,
-        answer: Annotation<string>,
-      });
-
-      const retrieve = async (state: typeof InputStateAnnotation.State) => {
-        const retrievedDocs = await vectorStore.similaritySearch(state.question);
-        return { context: retrievedDocs };
-      };
-
-      const generate = async (state: typeof StateAnnotation.State) => {
-        const docsContent = state.context.map(doc => doc.pageContent).join("\n");
-        const messages = await promptTemplate.invoke({ question: state.question, context: docsContent });
-        const response = await llm.invoke(messages);
-        return { answer: response.content };
-      };
-
-      const graph = new StateGraph(StateAnnotation)
-          .addNode("retrieve", retrieve)
-          .addNode("generate", generate)
-          .addEdge("__start__", "retrieve")
-          .addEdge("retrieve", "generate")
-          .addEdge("generate", "__end__")
-          .compile();
-
-      // Invoke the graph and get the result
-      const result = await graph.invoke({ question: message });
-
-      console.log(`\nCitations: ${result.context.length}`);
-      console.log(result.context.slice(0, 2));
-
-      return result.answer;
-    } catch ( err ) {
       console.log("Error in GenAIService.rag:", err);
       return null;
     }
